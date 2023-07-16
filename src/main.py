@@ -63,27 +63,27 @@ class AudioPlot:
         self.update_plot(np.zeros(self.CHUNK), False)  # Initialize plot with zeros
 
 
-    def update_plot(self, chunk, is_speech_detected: bool, speech_active_change_idx: int = 0):
-        # Update x-axis range
+    def update_plot(self, chunk, is_speech_detected: bool, change_idx: int = 0):
+        # Roll the window and update with new chunk
         self.window = np.roll(self.window, -len(chunk))
         self.window[-len(chunk):] = chunk
 
-        # roll the VAD signal to the left by the number of samples since the last chunk
+        # Roll the VAD signal
         self.VAD_signal = np.roll(self.VAD_signal, -len(chunk))
 
         # Now update the VAD plot
-        # If speech detected state has changed in this chunk, update the plot
         if self.previous_speech_detected != is_speech_detected:
-            self.VAD_signal[-len(chunk):speech_active_change_idx] = self.previous_speech_detected
-            self.VAD_signal[speech_active_change_idx:] = is_speech_detected
+            # If state has changed, update the plot accordingly
+            self.VAD_signal[-len(chunk):-change_idx] = self.previous_speech_detected
+            self.VAD_signal[-change_idx:] = is_speech_detected
             self.previous_speech_detected = is_speech_detected
         else:
+            # If state hasn't changed, update the whole chunk with the current state
             self.VAD_signal[-len(chunk):] = is_speech_detected
-            
 
         # Update the plotted data
         self.line1.set_ydata(self.window)
-        self.line2.set_ydata(self.VAD_signal*(self.window.max() // 2))
+        self.line2.set_ydata(self.VAD_signal * (self.window.max() // 2))
         self.ax.set_ylim(-self.window.max(), self.window.max())
 
         # Draw the new data
@@ -115,7 +115,7 @@ def process_audio(q: queue.Queue, sample_rate: int, chunk_size: int, processing_
     noise_floor: int = 300
     chunk_start_sample = 0
     speech_is_active = False
-    speech_active_change_idx = 0
+    absolute_change_idx = 0
 
     processing_ready_sem.release()
 
@@ -124,25 +124,22 @@ def process_audio(q: queue.Queue, sample_rate: int, chunk_size: int, processing_
         chunk = np.where(np.abs(chunk) > noise_floor, chunk, 0)
         logging.debug(f"Chunk start sample: {chunk_start_sample}")
 
-        # Update the indexes in the chunk to be relative to the start of the audio
-        np.roll(chunk, -chunk_start_sample)
-
         # Process the chunk
         speech_dict = vad_iterator(chunk)
         if speech_dict is not None:
             if speech_dict.get('start') is not None:
-                logging.debug("Speech detected")
-                speech_active_change_idx = speech_dict['start']
+                logging.debug("Speech detected @ sample: " + str(speech_dict['start']))
+                absolute_change_idx = speech_dict['start']
                 speech_is_active = True
             elif speech_dict.get('end') is not None:
-                logging.debug("Speech ended")
-                speech_active_change_idx = speech_dict['end']
+                logging.debug("Speech ended @ sample: " + str(speech_dict['end']))
+                absolute_change_idx = speech_dict['end']
                 speech_is_active = False
-            speech_active_change_idx -= chunk_start_sample
         else:
-            speech_active_change_idx = 0
+            absolute_change_idx = 0
 
-        audio_plot.update_plot(chunk, speech_is_active, speech_active_change_idx)
+        relative_change_idx = absolute_change_idx - chunk_start_sample
+        audio_plot.update_plot(chunk, speech_is_active, relative_change_idx)
         chunk_start_sample += len(chunk)
 
 def capture_audio(input_device_idx: int, sample_rate: int, chunk_size: int, q: queue.Queue):
