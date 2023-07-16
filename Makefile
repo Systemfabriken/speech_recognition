@@ -22,7 +22,7 @@ environment: download_models
 	sudo apt install -y qttools5-dev-tools
 
 	# Install other dependencies
-	sudo apt-get install -y libxcb-xinerama0 portaudio19-dev
+	sudo apt-get install -y libxcb-xinerama0 portaudio19-dev ffmpeg python3-av libavdevice-dev libavdevice59
 
 	unset GTK_PATH
 
