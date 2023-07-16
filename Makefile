@@ -13,7 +13,7 @@ default_target: build
 .PHONY: default_target
 
 # Target for creating environment
-environment:
+environment: download_models
 	# Install Python3 and pip3
 	sudo apt update
 	sudo apt install -y python3 python3-pip python3-venv
@@ -31,7 +31,7 @@ environment:
 	source $(VENV_PATH)
 
 	# Install the necessary Python libraries inside the virtual environment
-	source $(VENV_PATH) && pip3 install pyqt5 pyqt5-tools opencv-python-headless dlib face_recognition scikit-learn sounddevice openai-whisper pyaudio torch torchaudio IPython
+	source $(VENV_PATH) && pip3 install pyqt5 pyqt5-tools opencv-python-headless dlib face_recognition scikit-learn sounddevice openai-whisper pyaudio torch torchaudio IPython matplotlib
 
 .PHONY: environment
 
