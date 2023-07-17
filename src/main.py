@@ -6,9 +6,11 @@ import matplotlib.pyplot as plt
 import torch
 import queue
 import threading
+import whisper
+import ffmpeg
 torch.set_num_threads(1)
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def get_audio_interface():
     """Presents available audio interfaces to the user and returns the selected one."""
@@ -62,7 +64,6 @@ class AudioPlot:
         self.line2, = self.ax.plot(self.VAD_signal, color='r')  # VAD plot, in red
         self.update_plot(np.zeros(self.CHUNK), False)  # Initialize plot with zeros
 
-
     def update_plot(self, chunk, is_speech_detected: bool, change_idx: int = 0):
         # Roll the window and update with new chunk
         self.window = np.roll(self.window, -len(chunk))
@@ -90,12 +91,44 @@ class AudioPlot:
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
 
+class SpeechSegment:
+    def __init__(self, model: whisper.Whisper, sample_rate):
+        self.model = model
+        self.sample_rate = sample_rate
+        self.chunks: np.NDArray[np.int16] = np.array([])
+
+    def add_chunk(self, chunk):
+        self.chunks = np.append(self.chunks, chunk)
+
+    def get_audio(self):
+        return (self.chunks.astype(np.float32) / 32768.0)
+    
+    def get_duration(self):
+        return len(self.chunks) / self.sample_rate
+    
+    def get_sample_count(self):
+        return len(self.chunks)
+    
+    def convert_to_text(self) -> str | None:
+
+        if len(self.chunks) == 0:
+            return None
+        
+        audio = whisper.pad_or_trim(self.get_audio())
+        result = self.model.transcribe(audio)
+        return result['text']
+
+    def clear(self):
+        self.chunks = np.array([])
+
 def process_audio(q: queue.Queue, sample_rate: int, chunk_size: int, processing_ready_sem: threading.Semaphore):
     """
     Processes audio from the queue.
     """
 
     audio_plot = AudioPlot(sample_rate, chunk_size)
+
+    stt_model = whisper.load_model("base")
 
     model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad',
                               model='silero_vad',
@@ -110,14 +143,15 @@ def process_audio(q: queue.Queue, sample_rate: int, chunk_size: int, processing_
 
     vad_iterator = VADIterator(model, sampling_rate=sample_rate)
 
-    # model.reset_states()
-    # speech_probability_threshold: float = 0.5
     noise_floor: int = 300
     chunk_start_sample = 0
     speech_is_active = False
     absolute_change_idx = 0
+    previous_chunk = np.array([])
 
     processing_ready_sem.release()
+
+    speech_segment = SpeechSegment(stt_model, sample_rate)
 
     while True:
         chunk = q.get()
@@ -131,16 +165,26 @@ def process_audio(q: queue.Queue, sample_rate: int, chunk_size: int, processing_
                 logging.debug("Speech detected @ sample: " + str(speech_dict['start']))
                 absolute_change_idx = speech_dict['start']
                 speech_is_active = True
+                speech_segment.add_chunk(previous_chunk)
+                speech_segment.add_chunk(chunk)
             elif speech_dict.get('end') is not None:
                 logging.debug("Speech ended @ sample: " + str(speech_dict['end']))
                 absolute_change_idx = speech_dict['end']
                 speech_is_active = False
+                speech_segment.add_chunk(chunk)
+                text = speech_segment.convert_to_text()
+                speech_segment.clear()
+                if text is not None:
+                    print(text)
         else:
             absolute_change_idx = 0
+            if speech_is_active:
+                speech_segment.add_chunk(chunk)
 
         relative_change_idx = absolute_change_idx - chunk_start_sample
         audio_plot.update_plot(chunk, speech_is_active, relative_change_idx)
         chunk_start_sample += len(chunk)
+        previous_chunk = chunk
 
 def capture_audio(input_device_idx: int, sample_rate: int, chunk_size: int, q: queue.Queue):
     """
@@ -153,7 +197,7 @@ def capture_audio(input_device_idx: int, sample_rate: int, chunk_size: int, q: q
     )
     try:
         while True:
-            chunk = np.frombuffer(audio_stream.read(chunk_size), dtype=np.int16)
+            chunk: np.NDArray[np.int16] = np.frombuffer(audio_stream.read(chunk_size), dtype=np.int16)
             q.put(chunk)
     finally:
         try:
@@ -165,12 +209,13 @@ def capture_audio(input_device_idx: int, sample_rate: int, chunk_size: int, q: q
 
 if __name__ == '__main__':
     chosen_interface, rate = get_audio_interface()
-    print(f'Chosen interface: {chosen_interface}')
-    print(f'Chosen sample rate: {rate}')
+    logging.debug(f'Chosen interface: {chosen_interface}')
+    logging.info(f'Chosen sample rate: {rate}')
 
     chunk_size = rate // 2 # 500 ms
 
     q = queue.Queue()
+
     processing_ready_sem = threading.Semaphore(0)
     processing_thread = threading.Thread(target=process_audio, args=(q, rate, chunk_size, processing_ready_sem))
     processing_thread.start()
