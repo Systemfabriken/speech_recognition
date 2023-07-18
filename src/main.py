@@ -106,20 +106,15 @@ class AudioPlot:
         self.fig.canvas.flush_events()
 
 class SpeechSegment:
-    def __init__(self, model: whisper.Whisper, sample_rate):
+    def __init__(self, model: whisper.Whisper):
         self.model = model
-        self.sample_rate = sample_rate
         self.chunks: np.NDArray[np.int16] = np.array([])
 
     def add_chunk(self, chunk):
-        # self.chunks = np.append(self.chunks, chunk)
-        self.model.embed_audio()
+        self.chunks = np.append(self.chunks, chunk)
 
     def get_audio(self):
         return (self.chunks.astype(np.float32) / 32768.0)
-    
-    def get_duration(self):
-        return len(self.chunks) / self.sample_rate
     
     def get_sample_count(self):
         return len(self.chunks)
@@ -138,7 +133,7 @@ class SpeechSegment:
 
 def tts_proc_fun(q: multiprocessing.Queue, tts_proc_ready_sem: multiprocessing.Semaphore):
     stt_model = whisper.load_model("tiny.en")
-    speech_segment = SpeechSegment(stt_model, sample_rate=16000)
+    speech_segment = SpeechSegment(stt_model)
     tts_proc_ready_sem.release()
 
     while True:
@@ -238,7 +233,7 @@ def capture_audio(q: multiprocessing.Queue):
 
     input_stream = audio_interface.open(
         format=pyaudio.paInt16, channels=1, rate=16000, input=True, 
-        frames_per_buffer=8000, input_device_index=input_device_info['index'], 
+        frames_per_buffer=4000, input_device_index=input_device_info['index'], 
         stream_callback=stream_callback
     )
 
