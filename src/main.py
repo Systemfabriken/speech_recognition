@@ -112,7 +112,8 @@ class SpeechSegment:
         self.chunks: np.NDArray[np.int16] = np.array([])
 
     def add_chunk(self, chunk):
-        self.chunks = np.append(self.chunks, chunk)
+        # self.chunks = np.append(self.chunks, chunk)
+        self.model.embed_audio()
 
     def get_audio(self):
         return (self.chunks.astype(np.float32) / 32768.0)
@@ -136,7 +137,7 @@ class SpeechSegment:
         self.chunks = np.array([])
 
 def tts_proc_fun(q: multiprocessing.Queue, tts_proc_ready_sem: multiprocessing.Semaphore):
-    stt_model = whisper.load_model("base")
+    stt_model = whisper.load_model("tiny.en")
     speech_segment = SpeechSegment(stt_model, sample_rate=16000)
     tts_proc_ready_sem.release()
 
