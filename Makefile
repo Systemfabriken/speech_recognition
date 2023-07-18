@@ -37,7 +37,7 @@ environment: download_models
 
 # Target for downloading the latest tflite model and scorer
 download_models:
-	mkdir $(SCRIPT_PATH)/models
+	mkdir -p $(SCRIPT_PATH)/models
 
 	# Download the latest tflite model
 	wget "https://github.com/coqui-ai/STT-models/releases/download/english%2Fcoqui%2Fv1.0.0-huge-vocab/model.tflite" -O $(SCRIPT_PATH)/models/model.tflite

@@ -6,11 +6,27 @@ import matplotlib.pyplot as plt
 import torch
 import queue
 import threading
+import multiprocessing
 import whisper
 import ffmpeg
+import scipy.signal as signal
+from scipy.signal import butter, lfilter
+import os
 torch.set_num_threads(1)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def butter_bandpass(lowcut, highcut, fs, order=5):
+    nyq = 0.5 * fs
+    low = lowcut / nyq
+    high = highcut / nyq
+    b, a = butter(order, [low, high], btype='band')
+    return b, a
+
+def butter_bandpass_filter(data, lowcut, highcut, fs, order=5):
+    b, a = butter_bandpass(lowcut, highcut, fs, order=order)
+    y = lfilter(b, a, data)
+    return y
 
 def get_audio_interface():
     """Presents available audio interfaces to the user and returns the selected one."""
@@ -48,46 +64,44 @@ def get_audio_interface():
     exit(1)
 
 class AudioPlot:
-    def __init__(self, rate: int, chunk_size: int):
+    def __init__(self, rate: int):
         self.RATE = rate
-        self.CHUNK = chunk_size
         self.PLOT_WINDOW_SIZE = rate * 15
         self.previous_speech_detected = False
 
-        self.window = np.zeros(self.PLOT_WINDOW_SIZE)  # For plotting
-        self.VAD_signal = np.zeros(self.PLOT_WINDOW_SIZE)  # For plotting
+        self.audio_window = np.zeros(self.PLOT_WINDOW_SIZE)
+        self.VAD_signal = np.zeros(self.PLOT_WINDOW_SIZE)
 
-        # Set up plot
-        plt.ion()  # Interactive mode
+        self.init_plots()
+
+    def init_plots(self):
         self.fig, self.ax = plt.subplots()
-        self.line1, = self.ax.plot(self.window)
-        self.line2, = self.ax.plot(self.VAD_signal, color='r')  # VAD plot, in red
-        self.update_plot(np.zeros(self.CHUNK), False)  # Initialize plot with zeros
+        self.audio_signal_line, = self.ax.plot(self.audio_window)
+        self.VAD_signal_line, = self.ax.plot(self.VAD_signal, color='r')
 
-    def update_plot(self, chunk, is_speech_detected: bool, change_idx: int = 0):
-        # Roll the window and update with new chunk
-        self.window = np.roll(self.window, -len(chunk))
-        self.window[-len(chunk):] = chunk
+        self.update_plot(np.zeros(self.PLOT_WINDOW_SIZE), False)
+        self.fig.show()
 
-        # Roll the VAD signal
+    def update_data(self, chunk, is_speech_detected: bool, change_idx: int = 0):
+        self.audio_window = np.roll(self.audio_window, -len(chunk))
+        self.audio_window[-len(chunk):] = chunk
+
         self.VAD_signal = np.roll(self.VAD_signal, -len(chunk))
 
-        # Now update the VAD plot
         if self.previous_speech_detected != is_speech_detected:
-            # If state has changed, update the plot accordingly
             self.VAD_signal[-len(chunk):-change_idx] = self.previous_speech_detected
             self.VAD_signal[-change_idx:] = is_speech_detected
             self.previous_speech_detected = is_speech_detected
         else:
-            # If state hasn't changed, update the whole chunk with the current state
             self.VAD_signal[-len(chunk):] = is_speech_detected
 
-        # Update the plotted data
-        self.line1.set_ydata(self.window)
-        self.line2.set_ydata(self.VAD_signal * (self.window.max() // 2))
-        self.ax.set_ylim(-self.window.max(), self.window.max())
+    def update_plot(self, chunk, is_speech_detected: bool, change_idx: int = 0):
+        self.update_data(chunk, is_speech_detected, change_idx)
+        
+        self.ax.set_ylim(-self.audio_window.max(), self.audio_window.max())
+        self.audio_signal_line.set_ydata(self.audio_window)
+        self.VAD_signal_line.set_ydata(self.VAD_signal * (self.audio_window.max() // 2))
 
-        # Draw the new data
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
 
@@ -121,105 +135,143 @@ class SpeechSegment:
     def clear(self):
         self.chunks = np.array([])
 
-def process_audio(q: queue.Queue, sample_rate: int, chunk_size: int, processing_ready_sem: threading.Semaphore):
+def tts_proc_fun(q: multiprocessing.Queue, tts_proc_ready_sem: multiprocessing.Semaphore):
+    stt_model = whisper.load_model("base")
+    speech_segment = SpeechSegment(stt_model, sample_rate=16000)
+    tts_proc_ready_sem.release()
+
+    while True:
+        segment = q.get()
+        speech_segment.add_chunk(segment)
+        text = speech_segment.convert_to_text()
+        speech_segment.clear()
+        if text is not None:
+            print(text)
+
+def process_audio(q: multiprocessing.Queue, plot_queue: multiprocessing.Queue, tts_proc_q: multiprocessing.Queue, processing_ready_sem: threading.Semaphore):
     """
     Processes audio from the queue.
     """
-
-    audio_plot = AudioPlot(sample_rate, chunk_size)
-
-    stt_model = whisper.load_model("base")
-
-    model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad',
-                              model='silero_vad',
-                              force_reload=True,
-                              onnx=False)
+    vad_model_dir = "./models"
+    vad_repo_dirname = "snakers4_silero-vad_master" 
+    vad_repo_path = os.path.join(vad_model_dir, vad_repo_dirname)
+    if os.path.isdir(vad_repo_path):
+        # Load the existing model
+        print("Loading model from disk...")
+        model, utils = torch.hub.load(repo_or_dir=vad_repo_path,
+                                        model='silero_vad',
+                                        source='local',
+                                        force_reload=False,
+                                        onnx=False)
+    else:
+        # Download the model and save it to disk
+        print("Downloading model...")
+        torch.hub.set_dir(vad_model_dir)
+        model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad',
+                                      model='silero_vad',
+                                      force_reload=True,
+                                      onnx=False)
     
-    (get_speech_timestamps,
-    save_audio,
-    read_audio,
+    (_, # get_speech_ts
+    _, # save_audio
+    _, # read_audio
     VADIterator,
-    collect_chunks) = utils
+    _) = utils # collect_chunks
 
-    vad_iterator = VADIterator(model, sampling_rate=sample_rate)
+    vad_iterator = VADIterator(model, sampling_rate=16000)
 
     noise_floor: int = 300
     chunk_start_sample = 0
     speech_is_active = False
     absolute_change_idx = 0
     previous_chunk = np.array([])
+    segment = np.array([])
 
     processing_ready_sem.release()
 
-    speech_segment = SpeechSegment(stt_model, sample_rate)
-
     while True:
         chunk = q.get()
-        chunk = np.where(np.abs(chunk) > noise_floor, chunk, 0)
+
+        preprocess_chunk = chunk.copy()
+        preprocess_chunk = butter_bandpass_filter(preprocess_chunk, 85, 255, 16000, order=5)
+        preprocess_chunk = np.where(np.abs(chunk) > noise_floor, chunk, 0)
         logging.debug(f"Chunk start sample: {chunk_start_sample}")
 
         # Process the chunk
-        speech_dict = vad_iterator(chunk)
+        speech_dict = vad_iterator(preprocess_chunk)
         if speech_dict is not None:
             if speech_dict.get('start') is not None:
-                logging.debug("Speech detected @ sample: " + str(speech_dict['start']))
+                logging.info("Speech detected @ sample: " + str(speech_dict['start']))
                 absolute_change_idx = speech_dict['start']
                 speech_is_active = True
-                speech_segment.add_chunk(previous_chunk)
-                speech_segment.add_chunk(chunk)
+                segment = np.append(segment, previous_chunk)
+                segment = np.append(segment, chunk)
             elif speech_dict.get('end') is not None:
-                logging.debug("Speech ended @ sample: " + str(speech_dict['end']))
+                logging.info("Speech ended @ sample: " + str(speech_dict['end']))
                 absolute_change_idx = speech_dict['end']
                 speech_is_active = False
-                speech_segment.add_chunk(chunk)
-                text = speech_segment.convert_to_text()
-                speech_segment.clear()
-                if text is not None:
-                    print(text)
+                segment = np.append(segment, chunk)
+                tts_proc_q.put(segment)
+                segment = np.array([])
         else:
             absolute_change_idx = 0
             if speech_is_active:
-                speech_segment.add_chunk(chunk)
+                segment = np.append(segment, chunk)
 
         relative_change_idx = absolute_change_idx - chunk_start_sample
-        audio_plot.update_plot(chunk, speech_is_active, relative_change_idx)
+        plot_queue.put((preprocess_chunk, speech_is_active, relative_change_idx))
         chunk_start_sample += len(chunk)
         previous_chunk = chunk
 
-def capture_audio(input_device_idx: int, sample_rate: int, chunk_size: int, q: queue.Queue):
+def capture_audio(q: multiprocessing.Queue):
     """
     Captures audio from the specified input device and puts it in a queue.
     """
     audio_interface = pyaudio.PyAudio()
-    audio_stream = audio_interface.open(
-        format=pyaudio.paInt16, channels=1, rate=sample_rate, input=True, 
-        frames_per_buffer=chunk_size, input_device_index=input_device_idx
+    input_device_info = audio_interface.get_default_input_device_info()
+    logging.info(f'Input device info: {input_device_info}')
+
+    def stream_callback(in_data, frame_count, time_info, status_flags):
+        q.put(np.frombuffer(in_data, dtype=np.int16))
+        return (None, pyaudio.paContinue)
+
+    input_stream = audio_interface.open(
+        format=pyaudio.paInt16, channels=1, rate=16000, input=True, 
+        frames_per_buffer=8000, input_device_index=input_device_info['index'], 
+        stream_callback=stream_callback
     )
-    try:
-        while True:
-            chunk: np.NDArray[np.int16] = np.frombuffer(audio_stream.read(chunk_size), dtype=np.int16)
-            q.put(chunk)
-    finally:
-        try:
-            audio_stream.stop_stream()
-        except OSError:
-            pass
-        audio_stream.close()
-        audio_interface.terminate()
+
+    logging.info('Starting stream...')
+    input_stream.start_stream()
+    while input_stream.is_active():
+        time.sleep(1)
+    logging.info('Capturing audio...')
+
+def run_audio_plotter(q: multiprocessing.Queue):
+    audio_plot = AudioPlot(rate=16000)
+    while True:
+        chunk, speech_is_active, relative_change_idx = q.get()
+        logging.debug(f'Plotting chunk of length {len(chunk)}')
+        audio_plot.update_plot(chunk, speech_is_active, relative_change_idx)
 
 if __name__ == '__main__':
-    chosen_interface, rate = get_audio_interface()
-    logging.debug(f'Chosen interface: {chosen_interface}')
-    logging.info(f'Chosen sample rate: {rate}')
+    manager = multiprocessing.Manager()
+    vad_proc_q = manager.Queue()
+    plot_proc_q = manager.Queue()
+    tts_proc_q = manager.Queue()
 
-    chunk_size = rate // 2 # 500 ms
+    tts_proc_sem = manager.Semaphore(0)
+    tts_proc = multiprocessing.Process(target=tts_proc_fun, args=(tts_proc_q, tts_proc_sem))
+    tts_proc.start()
+    tts_proc_sem.acquire()
 
-    q = queue.Queue()
-
-    processing_ready_sem = threading.Semaphore(0)
-    processing_thread = threading.Thread(target=process_audio, args=(q, rate, chunk_size, processing_ready_sem))
-    processing_thread.start()
-    processing_ready_sem.acquire()
+    vad_proc_sem = manager.Semaphore(0)
+    vad_proc = multiprocessing.Process(target=process_audio, args=(vad_proc_q, plot_proc_q, tts_proc_q, vad_proc_sem))
+    vad_proc.start()
+    vad_proc_sem.acquire()
 
     print('Ready to process audio')
-    capture_audio(chosen_interface, rate, chunk_size, q)
+    capture_proc = multiprocessing.Process(target=capture_audio, args=(vad_proc_q,))
+    capture_proc.start()
+    
+    run_audio_plotter(plot_proc_q)
