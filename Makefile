@@ -31,7 +31,7 @@ environment: download_models
 	source $(VENV_PATH)
 
 	# Install the necessary Python libraries inside the virtual environment
-	source $(VENV_PATH) && pip3 install pyqt5 pyqt5-tools opencv-python-headless dlib face_recognition scikit-learn sounddevice openai-whisper pyaudio torch torchaudio IPython matplotlib
+	source $(VENV_PATH) && pip3 install pyqt5 pyqt5-tools opencv-python-headless dlib face_recognition scikit-learn sounddevice openai-whisper pyaudio torch torchaudio IPython matplotlib transformers
 
 .PHONY: environment
 
